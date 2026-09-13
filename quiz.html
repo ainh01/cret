@@ -1,0 +1,487 @@
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Quiz Parser and Randomizer</title>
+</head>
+<body>
+  <div>
+    <button id="pasteButton" type="button">Paste</button>
+    <button id="parseButton" type="button">Parse and Random</button>
+    <button id="copyButton" type="button">Copy Output</button>
+    <label>
+      <input id="randomizeQuestions" type="checkbox">
+      Randomize question order
+    </label>
+  </div>
+
+  <p>Input</p>
+  <textarea id="inputText" rows="18" cols="120"></textarea>
+
+  <p>Output</p>
+  <textarea id="outputText" rows="18" cols="120"></textarea>
+
+  <script>
+    const inputText = document.getElementById("inputText");
+    const outputText = document.getElementById("outputText");
+    const pasteButton = document.getElementById("pasteButton");
+    const parseButton = document.getElementById("parseButton");
+    const copyButton = document.getElementById("copyButton");
+    const randomizeQuestions = document.getElementById("randomizeQuestions");
+
+    const START_MARKER = "```quiz";
+    const END_MARKER = "endquiz```";
+    const OPTION_VALUES = ["A", "B", "C", "D"];
+
+    pasteButton.addEventListener("click", async function () {
+      try {
+        const text = await navigator.clipboard.readText();
+        inputText.value = text;
+      } catch (error) {
+        outputText.value = "Clipboard paste failed.\n\nYour browser may require clipboard permission or a secure context.\n\nDetails: " + error.message;
+      }
+    });
+
+    copyButton.addEventListener("click", async function () {
+      try {
+        await navigator.clipboard.writeText(outputText.value);
+      } catch (error) {
+        try {
+          outputText.focus();
+          outputText.select();
+          document.execCommand("copy");
+        } catch (fallbackError) {
+          outputText.value = "Clipboard copy failed.\n\nDetails: " + error.message;
+        }
+      }
+    });
+
+    parseButton.addEventListener("click", function () {
+      try {
+        const result = processInput(inputText.value, randomizeQuestions.checked);
+        outputText.value = result;
+      } catch (error) {
+        outputText.value = error.message;
+      }
+    });
+
+    function processInput(text, shouldRandomizeQuestions) {
+      const normalizedText = normalizeQuizFences(text);
+      const blocks = extractQuizBlocks(normalizedText);
+
+      if (blocks.length === 0) {
+        throw new Error(
+          "No quiz block found.\n\n" +
+          "A valid block must start with exactly:\n" +
+          START_MARKER + "\n\n" +
+          "And end with exactly:\n" +
+          END_MARKER
+        );
+      }
+
+      const processedBlocks = [];
+
+      for (let i = 0; i < blocks.length; i++) {
+        const block = blocks[i];
+
+        try {
+          const parsed = parsePossiblyBrokenJson(block.content, i + 1);
+          validateQuizArray(parsed, i + 1);
+
+          const randomized = randomizeQuiz(parsed, shouldRandomizeQuestions);
+          processedBlocks.push(formatQuizBlock(randomized));
+        } catch (error) {
+          throw new Error(
+            "Could not safely repair or parse quiz block #" + (i + 1) + ".\n\n" +
+            error.message + "\n\n" +
+            "Broken block preview:\n" +
+            makePreview(block.content)
+          );
+        }
+      }
+
+      return processedBlocks.join("\n\n");
+    }
+
+    function normalizeQuizFences(text) {
+      let result = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+      result = result.replace(/endquiz[ \t]*\n[ \t]*```/g, END_MARKER);
+
+      result = result.replace(/```[ \t]*\n[ \t]*quiz/g, START_MARKER);
+
+      return result;
+    }
+
+    function extractQuizBlocks(text) {
+      const blocks = [];
+      let searchFrom = 0;
+
+      while (true) {
+        const start = text.indexOf(START_MARKER, searchFrom);
+
+        if (start === -1) {
+          break;
+        }
+
+        const contentStart = start + START_MARKER.length;
+        let end = text.indexOf(END_MARKER, contentStart);
+        let repairedLooseEnd = false;
+
+        if (end === -1) {
+          const looseEndMatch = text.slice(contentStart).match(/(^|\n)[ \t]*endquiz[ \t]*(?=\n|$)/);
+
+          if (looseEndMatch) {
+            end = contentStart + looseEndMatch.index + looseEndMatch[1].length;
+            repairedLooseEnd = true;
+          }
+        }
+
+        if (end === -1) {
+          throw new Error(
+            "Malformed quiz block found.\n\n" +
+            "A block starts with " + START_MARKER + " but does not contain the required ending marker:\n" +
+            END_MARKER + "\n\n" +
+            "Block preview:\n" +
+            makePreview(text.slice(start))
+          );
+        }
+
+        blocks.push({
+          content: text.slice(contentStart, end).trim(),
+          repairedLooseEnd: repairedLooseEnd
+        });
+
+        searchFrom = repairedLooseEnd ? end + "endquiz".length : end + END_MARKER.length;
+      }
+
+      return blocks;
+    }
+
+    function parsePossiblyBrokenJson(text, blockNumber) {
+      const attempts = [];
+
+      attempts.push(text);
+      attempts.push(repairJsonLikeText(text));
+      attempts.push(repairJsonLikeText(repairJsonLikeText(text)));
+
+      let lastError = null;
+
+      for (let i = 0; i < attempts.length; i++) {
+        try {
+          return JSON.parse(attempts[i]);
+        } catch (error) {
+          lastError = error;
+        }
+      }
+
+      throw new Error(
+        "JSON parsing failed in block #" + blockNumber + ".\n\n" +
+        "Last parser error:\n" +
+        lastError.message
+      );
+    }
+
+    function repairJsonLikeText(text) {
+      let result = text;
+
+      result = result.replace(/^\uFEFF/, "");
+      result = result.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+      result = replaceSmartQuotes(result);
+      result = stripCodeFenceNoise(result);
+      result = convertSingleQuotedStrings(result);
+      result = quoteUnquotedKeys(result);
+      result = quoteUnquotedSimpleValues(result);
+      result = escapeBadCharactersInsideStrings(result);
+      result = removeTrailingCommas(result);
+
+      return result.trim();
+    }
+
+    function replaceSmartQuotes(text) {
+      return text
+        .replace(/[“”]/g, "\"")
+        .replace(/[‘’]/g, "'");
+    }
+
+    function stripCodeFenceNoise(text) {
+      return text
+        .replace(/^\s*```(?:json|javascript|js)?\s*/i, "")
+        .replace(/\s*```\s*$/i, "");
+    }
+
+    function convertSingleQuotedStrings(text) {
+  return text.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, function (_, value) {
+    return JSON.stringify(
+      value
+        .replace(/\\'/g, "'")
+        .replace(/\\n/g, "\n")
+    );
+  });
+}
+
+    function quoteUnquotedKeys(text) {
+      return text.replace(/([{,]\s*)([A-Za-z_$][A-Za-z0-9_$-]*)(\s*:)/g, function (_, before, key, after) {
+        return before + JSON.stringify(key) + after;
+      });
+    }
+
+    function quoteUnquotedSimpleValues(text) {
+      return text.replace(/:\s*([^"\{\[\]\},\n][^,\}\]\n]*?)(\s*)(?=,|\}|\])/g, function (_, rawValue, spacing) {
+        const value = rawValue.trim();
+
+        if (value === "") {
+          return ": " + rawValue + spacing;
+        }
+
+        if (/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(value)) {
+          return ": " + value + spacing;
+        }
+
+        if (/^(true|false|null)$/i.test(value)) {
+          return ": " + value.toLowerCase() + spacing;
+        }
+
+        return ": " + JSON.stringify(value) + spacing;
+      });
+    }
+
+    function escapeBadCharactersInsideStrings(text) {
+      let result = "";
+      let inString = false;
+      let escaped = false;
+
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+
+        if (!inString) {
+          result += ch;
+
+          if (ch === "\"") {
+            inString = true;
+            escaped = false;
+          }
+
+          continue;
+        }
+
+        if (escaped) {
+          result += ch;
+          escaped = false;
+          continue;
+        }
+
+        if (ch === "\\") {
+          result += ch;
+          escaped = true;
+          continue;
+        }
+
+        if (ch === "\"") {
+          const nextNonSpace = findNextNonSpace(text, i + 1);
+
+          if (
+            nextNonSpace === "," ||
+            nextNonSpace === "}" ||
+            nextNonSpace === "]" ||
+            nextNonSpace === ":" ||
+            nextNonSpace === ""
+          ) {
+            result += ch;
+            inString = false;
+          } else {
+            result += "\\\"";
+          }
+
+          continue;
+        }
+
+        if (ch === "\n") {
+          result += "\\n";
+          continue;
+        }
+
+        if (ch === "\t") {
+          result += "\\t";
+          continue;
+        }
+
+        result += ch;
+      }
+
+      return result;
+    }
+
+    function findNextNonSpace(text, startIndex) {
+      for (let i = startIndex; i < text.length; i++) {
+        if (!/\s/.test(text[i])) {
+          return text[i];
+        }
+      }
+
+      return "";
+    }
+
+    function removeTrailingCommas(text) {
+      let previous;
+
+      do {
+        previous = text;
+        text = text.replace(/,\s*([}\]])/g, "$1");
+      } while (text !== previous);
+
+      return text;
+    }
+
+    function validateQuizArray(value, blockNumber) {
+      if (!Array.isArray(value)) {
+        throw new Error("Block #" + blockNumber + " does not contain a JSON array.");
+      }
+
+      for (let i = 0; i < value.length; i++) {
+        const question = value[i];
+
+        if (!question || typeof question !== "object" || Array.isArray(question)) {
+          throw new Error("Question #" + (i + 1) + " is not an object.");
+        }
+
+        if (!Array.isArray(question.options)) {
+          throw new Error("Question #" + (i + 1) + " does not have an options array.");
+        }
+
+        if (question.options.length !== 4) {
+          throw new Error("Question #" + (i + 1) + " must have exactly 4 options.");
+        }
+
+        for (let j = 0; j < question.options.length; j++) {
+          const option = question.options[j];
+
+          if (!option || typeof option !== "object" || Array.isArray(option)) {
+            throw new Error("Question #" + (i + 1) + ", option #" + (j + 1) + " is not an object.");
+          }
+
+          if (!Object.prototype.hasOwnProperty.call(option, "label")) {
+            throw new Error("Question #" + (i + 1) + ", option #" + (j + 1) + " is missing label.");
+          }
+
+          if (!Object.prototype.hasOwnProperty.call(option, "value")) {
+            throw new Error("Question #" + (i + 1) + ", option #" + (j + 1) + " is missing value.");
+          }
+        }
+
+        const correctValue = String(question.correct);
+        const matchingOption = question.options.find(function (option) {
+          return String(option.value) === correctValue;
+        });
+
+        if (!matchingOption) {
+          throw new Error(
+            "Question #" + (i + 1) + " has a correct value that does not exactly match any option value: " +
+            JSON.stringify(question.correct)
+          );
+        }
+      }
+    }
+
+function randomizeQuiz(quizArray, shouldRandomizeQuestions) {
+  let questions = quizArray.map(function (question) {
+    return randomizeQuestionOptions(question);
+  });
+
+  if (shouldRandomizeQuestions) {
+    questions = shuffleArray(questions);
+
+    questions = questions.map(function (question, index) {
+      const updatedQuestion = {};
+      const keys = Object.keys(question);
+
+      if (keys.indexOf("id") === -1) {
+        updatedQuestion.id = index + 1;
+      }
+
+      keys.forEach(function (key) {
+        if (key === "id") {
+          updatedQuestion.id = index + 1;
+        } else {
+          updatedQuestion[key] = question[key];
+        }
+      });
+
+      return updatedQuestion;
+    });
+  }
+
+  return questions;
+}
+
+    function randomizeQuestionOptions(question) {
+      const originalCorrectValue = String(question.correct);
+      const originalCorrectOption = question.options.find(function (option) {
+        return String(option.value) === originalCorrectValue;
+      });
+
+      const shuffledOriginalOptions = shuffleArray(question.options);
+      let newCorrectValue = null;
+
+      const newOptions = shuffledOriginalOptions.map(function (option, index) {
+        const newValue = OPTION_VALUES[index];
+
+        if (option === originalCorrectOption) {
+          newCorrectValue = newValue;
+        }
+
+        return {
+          label: option.label,
+          value: newValue
+        };
+      });
+
+      const newQuestion = {};
+
+      Object.keys(question).forEach(function (key) {
+        if (key !== "options" && key !== "correct") {
+          newQuestion[key] = question[key];
+        }
+      });
+
+      newQuestion.options = newOptions;
+      newQuestion.correct = newCorrectValue;
+
+      if (Object.prototype.hasOwnProperty.call(question, "explanation")) {
+        newQuestion.explanation = question.explanation;
+      }
+
+      return newQuestion;
+    }
+
+    function shuffleArray(array) {
+      const copy = array.slice();
+
+      for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const temp = copy[i];
+        copy[i] = copy[j];
+        copy[j] = temp;
+      }
+
+      return copy;
+    }
+
+    function formatQuizBlock(quizArray) {
+      return START_MARKER + "\n" + JSON.stringify(quizArray, null, 2) + "\n" + END_MARKER;
+    }
+
+    function makePreview(text) {
+      const cleaned = String(text).trim();
+
+      if (cleaned.length <= 1200) {
+        return cleaned;
+      }
+
+      return cleaned.slice(0, 1200) + "\n\n... preview truncated ...";
+    }
+  </script>
+</body>
+</html>
