@@ -45,11 +45,17 @@ PROXY = os.getenv('PROXY', 'http://127.0.0.1:3128').strip() or None
 
 @asynccontextmanager
 async def lifespan(app):
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
     app.state.client = httpx.AsyncClient(
         proxy=PROXY, trust_env=False,
-        timeout=httpx.Timeout(1800, connect=30),
+        timeout=httpx.Timeout(1800, connect=30, pool=10),
+        limits=limits,
     )
-    app.state.direct_client = httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(1800, connect=30))
+    app.state.direct_client = httpx.AsyncClient(
+        trust_env=False,
+        timeout=httpx.Timeout(1800, connect=30, pool=10),
+        limits=limits,
+    )
     try:
         yield
     finally:
