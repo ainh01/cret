@@ -358,51 +358,49 @@ async def chat(body: ChatRequest):
             timeout=httpx.Timeout(1800, connect=30),
         )
         try:
-                try:
-                async with client.stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
-                    'model': body.model, 'messages': messages, 'stream': True,
-                }) as response:
-                    if response.is_error:
-                        await response.aread()
-                        yield event({'error': f'API returned HTTP {response.status_code}. Check the endpoint, model, and token.'})
+            async with client.stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
+                'model': body.model, 'messages': messages, 'stream': True,
+            }) as response:
+                if response.is_error:
+                    await response.aread()
+                    yield event({'error': f'API returned HTTP {response.status_code}. Check the endpoint, model, and token.'})
+                    return
+                if 'application/json' in response.headers.get('content-type', ''):
+                    data = json.loads(await response.aread())
+                    text = data['choices'][0]['message'].get('content') or ''
+                    yield event({'text': text})
+                    yield event({'done': True})
+                    return
+                finished = False
+                async for line in response.aiter_lines():
+                    if not line.startswith('data:'):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == '[DONE]':
+                        finished = True
+                        break
+                    data = json.loads(payload)
+                    if data.get('error'):
+                        yield event({'error': 'The provider reported a generation error. Please retry.'})
                         return
-                    if 'application/json' in response.headers.get('content-type', ''):
-                        data = json.loads(await response.aread())
-                        text = data['choices'][0]['message'].get('content') or ''
-                        yield event({'text': text})
-                        yield event({'done': True})
-                        return
-                    finished = False
-                    async for line in response.aiter_lines():
-                        if not line.startswith('data:'):
-                            continue
-                        payload = line[5:].strip()
-                        if payload == '[DONE]':
+                    for choice in data.get('choices', []):
+                        text = choice.get('delta', {}).get('content')
+                        if text:
+                            full += text
+                            if to_client:
+                                yield event({'text': text})
+                        if choice.get('finish_reason'):
                             finished = True
-                            break
-                        data = json.loads(payload)
-                        if data.get('error'):
-                            yield event({'error': 'The provider reported a generation error. Please retry.'})
-                            return
-                        for choice in data.get('choices', []):
-                            text = choice.get('delta', {}).get('content')
-                            if text:
-                                full += text
-                                if to_client:
-                                    yield event({'text': text})
-                            if choice.get('finish_reason'):
-                                finished = True
-                    if finished:
-                        if not to_client and full:
-                            yield event({'text': full})
-                        yield event({'done': True})
-                    else:
-                        yield event({'error': 'The stream ended unexpectedly. Partial output is preserved.'})
-            except httpx.HTTPError:
-                yield event({'error': 'Connection failed or timed out. Check the configured proxy and endpoint. Partial output is preserved.'})
-            except (ValueError, KeyError, TypeError):
-                yield event({'error': 'The endpoint returned an unexpected response format.'})
-            finally:
-                await client.aclose()
-
+                if finished:
+                    if not to_client and full:
+                        yield event({'text': full})
+                    yield event({'done': True})
+                else:
+                    yield event({'error': 'The stream ended unexpectedly. Partial output is preserved.'})
+        except httpx.HTTPError:
+            yield event({'error': 'Connection failed or timed out. Check the configured proxy and endpoint. Partial output is preserved.'})
+        except (ValueError, KeyError, TypeError):
+            yield event({'error': 'The endpoint returned an unexpected response format.'})
+        finally:
+            await client.aclose()
     return StreamingResponse(events(), media_type='application/x-ndjson', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
