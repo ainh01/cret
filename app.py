@@ -4,6 +4,9 @@ import tempfile
 from urllib.parse import urlsplit
 from contextlib import asynccontextmanager
 from pathlib import Path
+import asyncio
+import uuid
+from datetime import datetime, timedelta
 
 import httpx
 from dotenv import load_dotenv, set_key
@@ -56,6 +59,7 @@ async def lifespan(app):
         timeout=httpx.Timeout(1800, connect=30, pool=None),
         limits=limits,
     )
+    app.state.chat_cache = {}
     try:
         yield
     finally:
@@ -210,6 +214,97 @@ class ChatRequest(BaseModel):
     model: str = Field(min_length=1, max_length=300)
     previous: str | None = Field(default=None, max_length=4000000)
     followup: str | None = Field(default=None, max_length=1000000)
+    cache_id: str | None = Field(default=None, max_length=100)
+
+
+class PrepareRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=1000000)
+    model: str = Field(min_length=1, max_length=300)
+    previous: str | None = Field(default=None, max_length=4000000)
+    followup: str | None = Field(default=None, max_length=1000000)
+
+
+@app.post('/api/prepare-chat')
+async def prepare_chat(body: PrepareRequest):
+    if not settings.endpoint or not settings.token:
+        raise HTTPException(503, 'TOKEN and ENDPOINT are required.')
+    
+    cache_id = str(uuid.uuid4())
+    messages = [{'role': 'user', 'content': body.prompt}]
+    if body.followup:
+        if not body.previous:
+            raise HTTPException(400, 'A completed response is required before following up.')
+        messages += [{'role': 'assistant', 'content': body.previous}, {'role': 'user', 'content': body.followup}]
+    
+    cache_entry = {
+        'chunks': [],
+        'completed': False,
+        'error': None,
+        'expires_at': datetime.now() + timedelta(hours=1),
+        'lock': asyncio.Lock()
+    }
+    app.state.chat_cache[cache_id] = cache_entry
+    
+    asyncio.create_task(stream_to_cache(cache_id, body.model, messages))
+    
+    return {'cache_id': cache_id}
+
+
+async def stream_to_cache(cache_id: str, model: str, messages: list):
+    cache_entry = app.state.chat_cache.get(cache_id)
+    if not cache_entry:
+        return
+    
+    endpoint, token = settings.endpoint, settings.token
+    client = httpx.AsyncClient(
+        proxy=PROXY if settings.use_proxy else None,
+        trust_env=False,
+        timeout=httpx.Timeout(1800, connect=30),
+    )
+    
+    try:
+        async with client.stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
+            'model': model, 'messages': messages, 'stream': True,
+        }) as response:
+            if response.is_error:
+                await response.aread()
+                cache_entry['error'] = f'API returned HTTP {response.status_code}'
+                cache_entry['completed'] = True
+                return
+            
+            if 'application/json' in response.headers.get('content-type', ''):
+                data = json.loads(await response.aread())
+                text = data['choices'][0]['message'].get('content') or ''
+                cache_entry['chunks'].append(text)
+                cache_entry['completed'] = True
+                return
+            
+            async for line in response.aiter_lines():
+                if not line.startswith('data:'):
+                    continue
+                payload = line[5:].strip()
+                if payload == '[DONE]':
+                    cache_entry['completed'] = True
+                    break
+                data = json.loads(payload)
+                if data.get('error'):
+                    cache_entry['error'] = 'Provider error'
+                    cache_entry['completed'] = True
+                    return
+                for choice in data.get('choices', []):
+                    text = choice.get('delta', {}).get('content')
+                    if text:
+                        cache_entry['chunks'].append(text)
+                    if choice.get('finish_reason'):
+                        cache_entry['completed'] = True
+    except httpx.HTTPError:
+        cache_entry['error'] = 'Connection failed'
+        cache_entry['completed'] = True
+    except (ValueError, KeyError, TypeError):
+        cache_entry['error'] = 'Unexpected response format'
+        cache_entry['completed'] = True
+    finally:
+        await client.aclose()
 
 
 @app.post('/api/chat')
@@ -226,6 +321,36 @@ async def chat(body: ChatRequest):
     async def events():
         def event(data):
             return json.dumps(data) + '\n'
+        
+        if body.cache_id and body.cache_id in app.state.chat_cache:
+            cache_entry = app.state.chat_cache[body.cache_id]
+            
+            if datetime.now() > cache_entry['expires_at']:
+                del app.state.chat_cache[body.cache_id]
+            else:
+                sent_chunks = 0
+                while True:
+                    if cache_entry['error']:
+                        yield event({'error': cache_entry['error']})
+                        del app.state.chat_cache[body.cache_id]
+                        return
+                    
+                    while sent_chunks < len(cache_entry['chunks']):
+                        chunk = cache_entry['chunks'][sent_chunks]
+                        if to_client:
+                            yield event({'text': chunk})
+                        sent_chunks += 1
+                    
+                    if cache_entry['completed']:
+                        if not to_client and cache_entry['chunks']:
+                            full_text = ''.join(cache_entry['chunks'])
+                            yield event({'text': full_text})
+                        yield event({'done': True})
+                        del app.state.chat_cache[body.cache_id]
+                        return
+                    
+                    await asyncio.sleep(0.1)
+        
         full = ''
         client = httpx.AsyncClient(
             proxy=PROXY if settings.use_proxy else None,
@@ -233,50 +358,51 @@ async def chat(body: ChatRequest):
             timeout=httpx.Timeout(1800, connect=30),
         )
         try:
-            async with client.stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
-                'model': body.model, 'messages': messages, 'stream': True,
-            }) as response:
-                if response.is_error:
-                    await response.aread()
-                    yield event({'error': f'API returned HTTP {response.status_code}. Check the endpoint, model, and token.'})
-                    return
-                if 'application/json' in response.headers.get('content-type', ''):
-                    data = json.loads(await response.aread())
-                    text = data['choices'][0]['message'].get('content') or ''
-                    yield event({'text': text})
-                    yield event({'done': True})
-                    return
-                finished = False
-                async for line in response.aiter_lines():
-                    if not line.startswith('data:'):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == '[DONE]':
-                        finished = True
-                        break
-                    data = json.loads(payload)
-                    if data.get('error'):
-                        yield event({'error': 'The provider reported a generation error. Please retry.'})
+                try:
+                async with client.stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
+                    'model': body.model, 'messages': messages, 'stream': True,
+                }) as response:
+                    if response.is_error:
+                        await response.aread()
+                        yield event({'error': f'API returned HTTP {response.status_code}. Check the endpoint, model, and token.'})
                         return
-                    for choice in data.get('choices', []):
-                        text = choice.get('delta', {}).get('content')
-                        if text:
-                            full += text
-                            if to_client:
-                                yield event({'text': text})
-                        if choice.get('finish_reason'):
+                    if 'application/json' in response.headers.get('content-type', ''):
+                        data = json.loads(await response.aread())
+                        text = data['choices'][0]['message'].get('content') or ''
+                        yield event({'text': text})
+                        yield event({'done': True})
+                        return
+                    finished = False
+                    async for line in response.aiter_lines():
+                        if not line.startswith('data:'):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == '[DONE]':
                             finished = True
-                if finished:
-                    if not to_client and full:
-                        yield event({'text': full})
-                    yield event({'done': True})
-                else:
-                    yield event({'error': 'The stream ended unexpectedly. Partial output is preserved.'})
-        except httpx.HTTPError:
-            yield event({'error': 'Connection failed or timed out. Check the configured proxy and endpoint. Partial output is preserved.'})
-        except (ValueError, KeyError, TypeError):
-            yield event({'error': 'The endpoint returned an unexpected response format.'})
-        finally:
-            await client.aclose()
+                            break
+                        data = json.loads(payload)
+                        if data.get('error'):
+                            yield event({'error': 'The provider reported a generation error. Please retry.'})
+                            return
+                        for choice in data.get('choices', []):
+                            text = choice.get('delta', {}).get('content')
+                            if text:
+                                full += text
+                                if to_client:
+                                    yield event({'text': text})
+                            if choice.get('finish_reason'):
+                                finished = True
+                    if finished:
+                        if not to_client and full:
+                            yield event({'text': full})
+                        yield event({'done': True})
+                    else:
+                        yield event({'error': 'The stream ended unexpectedly. Partial output is preserved.'})
+            except httpx.HTTPError:
+                yield event({'error': 'Connection failed or timed out. Check the configured proxy and endpoint. Partial output is preserved.'})
+            except (ValueError, KeyError, TypeError):
+                yield event({'error': 'The endpoint returned an unexpected response format.'})
+            finally:
+                await client.aclose()
 
     return StreamingResponse(events(), media_type='application/x-ndjson', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
