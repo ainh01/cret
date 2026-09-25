@@ -5,3 +5,24 @@ __pycache__/
 .pytest_cache/
 node_modules/
 test-results/
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# QuickJS build artifacts
+qs_build/
+qs_wheel/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

@@ -60,9 +60,19 @@ async def lifespan(app):
         limits=limits,
     )
     app.state.chat_cache = {}
+
+    async def cache_janitor():
+        while True:
+            await asyncio.sleep(60)
+            purge_expired_cache()
+
+    janitor = asyncio.create_task(cache_janitor())
     try:
         yield
     finally:
+        janitor.cancel()
+        for cache_id in list(app.state.chat_cache):
+            drop_cache_entry(cache_id)
         await app.state.client.aclose()
         await app.state.direct_client.aclose()
 
@@ -209,9 +219,24 @@ async def quiz_parser():
     return Response(script, media_type='application/javascript')
 
 
+def drop_cache_entry(cache_id):
+    entry = app.state.chat_cache.pop(cache_id, None)
+    if entry:
+        task = entry.get('task')
+        if task and not task.done():
+            task.cancel()
+    return entry
+
+
+def purge_expired_cache():
+    now = datetime.now()
+    for cache_id in [cid for cid, entry in app.state.chat_cache.items() if now > entry['expires_at']]:
+        drop_cache_entry(cache_id)
+
+
 class ChatRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=1000000)
-    model: str = Field(min_length=1, max_length=300)
+    prompt: str | None = Field(default=None, max_length=1000000)
+    model: str | None = Field(default=None, max_length=300)
     previous: str | None = Field(default=None, max_length=4000000)
     followup: str | None = Field(default=None, max_length=1000000)
     cache_id: str | None = Field(default=None, max_length=100)
@@ -241,11 +266,11 @@ async def prepare_chat(body: PrepareRequest):
         'completed': False,
         'error': None,
         'expires_at': datetime.now() + timedelta(hours=1),
-        'lock': asyncio.Lock()
+        'task': None
     }
     app.state.chat_cache[cache_id] = cache_entry
     
-    asyncio.create_task(stream_to_cache(cache_id, body.model, messages))
+    cache_entry['task'] = asyncio.create_task(stream_to_cache(cache_id, body.model, messages))
     
     return {'cache_id': cache_id}
 
@@ -256,14 +281,9 @@ async def stream_to_cache(cache_id: str, model: str, messages: list):
         return
     
     endpoint, token = settings.endpoint, settings.token
-    client = httpx.AsyncClient(
-        proxy=PROXY if settings.use_proxy else None,
-        trust_env=False,
-        timeout=httpx.Timeout(1800, connect=30),
-    )
     
     try:
-        async with client.stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
+        async with api_client().stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
             'model': model, 'messages': messages, 'stream': True,
         }) as response:
             if response.is_error:
@@ -297,44 +317,57 @@ async def stream_to_cache(cache_id: str, model: str, messages: list):
                         cache_entry['chunks'].append(text)
                     if choice.get('finish_reason'):
                         cache_entry['completed'] = True
+            
+            # Ensure completed is set even if stream ends without [DONE]
+            cache_entry['completed'] = True
     except httpx.HTTPError:
         cache_entry['error'] = 'Connection failed'
         cache_entry['completed'] = True
     except (ValueError, KeyError, TypeError):
         cache_entry['error'] = 'Unexpected response format'
         cache_entry['completed'] = True
-    finally:
-        await client.aclose()
+    except Exception as e:
+        import sys, traceback
+        print(f"stream_to_cache error: {e}", file=sys.stderr)
+        traceback.print_exc()
+        cache_entry['error'] = 'Generation failed unexpectedly.'
+        cache_entry['completed'] = True
 
 
 @app.post('/api/chat')
 async def chat(body: ChatRequest):
-    if not settings.endpoint or not settings.token:
-        raise HTTPException(503, 'TOKEN and ENDPOINT are required.')
+    cache_entry = None
+    if body.cache_id:
+        cache_entry = app.state.chat_cache.get(body.cache_id)
+        if cache_entry and datetime.now() > cache_entry['expires_at']:
+            drop_cache_entry(body.cache_id)
+            cache_entry = None
+        if cache_entry is None and not (body.prompt and body.model):
+            raise HTTPException(404, 'The prepared response is no longer available. Re-run this step.')
     endpoint, token, to_client = settings.endpoint, settings.token, settings.stream
-    messages = [{'role': 'user', 'content': body.prompt}]
-    if body.followup:
-        if not body.previous:
-            raise HTTPException(400, 'A completed response is required before following up.')
-        messages += [{'role': 'assistant', 'content': body.previous}, {'role': 'user', 'content': body.followup}]
+    
+    if cache_entry is None:
+        if not body.prompt:
+            raise HTTPException(422, 'A prompt is required.')
+        if not body.model:
+            raise HTTPException(422, 'A model is required.')
+        if not settings.endpoint or not settings.token:
+            raise HTTPException(503, 'TOKEN and ENDPOINT are required.')
+        
+        messages = [{'role': 'user', 'content': body.prompt}]
+        if body.followup:
+            if not body.previous:
+                raise HTTPException(400, 'A completed response is required before following up.')
+            messages += [{'role': 'assistant', 'content': body.previous}, {'role': 'user', 'content': body.followup}]
 
     async def events():
         def event(data):
             return json.dumps(data) + '\n'
         
-        if body.cache_id and body.cache_id in app.state.chat_cache:
-            cache_entry = app.state.chat_cache[body.cache_id]
-            
-            if datetime.now() > cache_entry['expires_at']:
-                del app.state.chat_cache[body.cache_id]
-            else:
-                sent_chunks = 0
+        if cache_entry is not None:
+            sent_chunks = 0
+            try:
                 while True:
-                    if cache_entry['error']:
-                        yield event({'error': cache_entry['error']})
-                        del app.state.chat_cache[body.cache_id]
-                        return
-                    
                     while sent_chunks < len(cache_entry['chunks']):
                         chunk = cache_entry['chunks'][sent_chunks]
                         if to_client:
@@ -342,23 +375,22 @@ async def chat(body: ChatRequest):
                         sent_chunks += 1
                     
                     if cache_entry['completed']:
-                        if not to_client and cache_entry['chunks']:
-                            full_text = ''.join(cache_entry['chunks'])
-                            yield event({'text': full_text})
-                        yield event({'done': True})
-                        del app.state.chat_cache[body.cache_id]
+                        if cache_entry['error']:
+                            yield event({'error': cache_entry['error']})
+                        else:
+                            if not to_client and cache_entry['chunks']:
+                                full_text = ''.join(cache_entry['chunks'])
+                                yield event({'text': full_text})
+                            yield event({'done': True})
                         return
                     
                     await asyncio.sleep(0.1)
+            finally:
+                drop_cache_entry(body.cache_id)
         
         full = ''
-        client = httpx.AsyncClient(
-            proxy=PROXY if settings.use_proxy else None,
-            trust_env=False,
-            timeout=httpx.Timeout(1800, connect=30),
-        )
         try:
-            async with client.stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
+            async with api_client().stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
                 'model': body.model, 'messages': messages, 'stream': True,
             }) as response:
                 if response.is_error:
@@ -401,6 +433,4 @@ async def chat(body: ChatRequest):
             yield event({'error': 'Connection failed or timed out. Check the configured proxy and endpoint. Partial output is preserved.'})
         except (ValueError, KeyError, TypeError):
             yield event({'error': 'The endpoint returned an unexpected response format.'})
-        finally:
-            await client.aclose()
     return StreamingResponse(events(), media_type='application/x-ndjson', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
