@@ -179,9 +179,13 @@ async function executeSteps(plan,input,model,signal,onStep,onText,request=genera
   function preview(index,text){previews.set(index,text);onText([...previews].sort((a,b)=>a[0]-b[0]).map(([i,value])=>`Step ${i+1}\n${value}`).join('\n\n────────\n\n'));}
   for(let index=1;index<plan.length;index++){
     const step=plan[index];
+    if(!step||!step.sources)throw Error(`Step ${index+1}: invalid step configuration.`);
     if(!step.sources.length)throw Error(`Step ${index+1}: select at least one source.`);
     if(step.type==='ai'&&step.sources.length!==1)throw Error(`Step ${index+1}: AI steps require one source. Use Combine for multiple sources.`);
-    for(const source of step.sources)if(!plan.slice(0,index).some(node=>node.id===source.id))throw Error(`Step ${index+1}: source must be an earlier step.`);
+    for(const source of step.sources){
+      if(!source||!source.id)throw Error(`Step ${index+1}: invalid source configuration.`);
+      if(!plan.slice(0,index).some(node=>node&&node.id===source.id))throw Error(`Step ${index+1}: source must be an earlier step.`);
+    }
   }
   async function quiz(source,result){
     if(!quizzes.has(source.id))quizzes.set(source.id,(async()=>{
@@ -200,19 +204,24 @@ async function executeSteps(plan,input,model,signal,onStep,onText,request=genera
   
   const parallelGroups=new Map();
   for(const [index,step] of plan.entries()){
+    if(!step||!step.sources)continue;
     if(step.type==='ai'&&step.sources.length===1){
-      const sourceId=step.sources[0].id;
-      if(!parallelGroups.has(sourceId))parallelGroups.set(sourceId,[]);
-      parallelGroups.get(sourceId).push(index);
+      const sourceId=step.sources[0]?.id;
+      if(sourceId!==undefined){
+        if(!parallelGroups.has(sourceId))parallelGroups.set(sourceId,[]);
+        parallelGroups.get(sourceId).push(index);
+      }
     }
   }
   
   for(const [index,step] of plan.entries()){
-    const sources=plan.slice(0,index).filter(node=>step.sources.some(source=>source.id===node.id));
+    if(!step||!step.sources)continue;
+    const sources=plan.slice(0,index).filter(node=>node&&step.sources.some(source=>source&&source.id===node.id));
     jobs.set(step.id,(async()=>{
       try{
         const results=await Promise.all(sources.map(async node=>{
-          const result=await jobs.get(node.id),source=step.sources.find(item=>item.id===node.id);
+          const result=await jobs.get(node.id),source=step.sources.find(item=>item&&item.id===node.id);
+          if(!source)throw Error(`Step ${index+1}: source configuration missing.`);
           return source.mode==='quiz'?quiz(source,result):selectContent(result.text,source.mode);
         }));
         if(signal.aborted)throw new DOMException('Stopped','AbortError');
@@ -223,9 +232,8 @@ async function executeSteps(plan,input,model,signal,onStep,onText,request=genera
         
         let text;
         if(step.type==='ai'){
-          const sourceId=step.sources[0].id;
-          const siblings=parallelGroups.get(sourceId)||[];
-          const isFirst=siblings[0]===index;
+          const sourceId=step.sources[0]?.id;
+          const siblings=(sourceId!==undefined)?parallelGroups.get(sourceId)||[]:[]; const isFirst=siblings[0]===index;
           
           if(isFirst&&siblings.length>1){
             for(let i=1;i<siblings.length;i++){
