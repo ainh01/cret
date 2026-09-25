@@ -227,20 +227,22 @@ async function executeSteps(plan,input,model,signal,onStep,onText,request=genera
           const siblings=parallelGroups.get(sourceId)||[];
           const isFirst=siblings[0]===index;
           
-          if(!isFirst&&siblings.length>1){
-            const cacheId=await prepares.get(index);
+          if(isFirst&&siblings.length>1){
+            for(let i=1;i<siblings.length;i++){
+              const siblingIndex=siblings[i];
+              prepares.set(siblingIndex,(async()=>{
+                const siblingStep=plan[siblingIndex];
+                const siblingPrompt=siblingStep.prefix+selected+siblingStep.suffix;
+                return await prepareChat(siblingPrompt,model,signal);
+              })());
+            }
+          }
+          
+          const preparePromise=prepares.get(index);
+          if(preparePromise){
+            const cacheId=await preparePromise;
             text=await request(prompt,model,signal,text=>preview(index,text),{cache_id:cacheId});
           }else{
-            if(siblings.length>1){
-              for(let i=1;i<siblings.length;i++){
-                const siblingIndex=siblings[i];
-                prepares.set(siblingIndex,(async()=>{
-                  const siblingStep=plan[siblingIndex];
-                  const siblingPrompt=siblingStep.prefix+selected+siblingStep.suffix;
-                  return await prepareChat(siblingPrompt,model,signal);
-                })());
-              }
-            }
             text=await request(prompt,model,signal,text=>preview(index,text));
           }
         }else{
