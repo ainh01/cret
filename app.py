@@ -48,12 +48,12 @@ async def lifespan(app):
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
     app.state.client = httpx.AsyncClient(
         proxy=PROXY, trust_env=False,
-        timeout=httpx.Timeout(1800, connect=30, pool=10),
+        timeout=httpx.Timeout(1800, connect=30, pool=None),
         limits=limits,
     )
     app.state.direct_client = httpx.AsyncClient(
         trust_env=False,
-        timeout=httpx.Timeout(1800, connect=30, pool=10),
+        timeout=httpx.Timeout(1800, connect=30, pool=None),
         limits=limits,
     )
     try:
