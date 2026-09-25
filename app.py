@@ -217,7 +217,6 @@ async def chat(body: ChatRequest):
     if not settings.endpoint or not settings.token:
         raise HTTPException(503, 'TOKEN and ENDPOINT are required.')
     endpoint, token, to_client = settings.endpoint, settings.token, settings.stream
-    client = api_client()
     messages = [{'role': 'user', 'content': body.prompt}]
     if body.followup:
         if not body.previous:
@@ -227,8 +226,12 @@ async def chat(body: ChatRequest):
     async def events():
         def event(data):
             return json.dumps(data) + '\n'
-        # Always stream from the provider; the setting only gates delivery to the browser.
         full = ''
+        client = httpx.AsyncClient(
+            proxy=PROXY if settings.use_proxy else None,
+            trust_env=False,
+            timeout=httpx.Timeout(1800, connect=30),
+        )
         try:
             async with client.stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
                 'model': body.model, 'messages': messages, 'stream': True,
@@ -273,5 +276,7 @@ async def chat(body: ChatRequest):
             yield event({'error': 'Connection failed or timed out. Check the configured proxy and endpoint. Partial output is preserved.'})
         except (ValueError, KeyError, TypeError):
             yield event({'error': 'The endpoint returned an unexpected response format.'})
+        finally:
+            await client.aclose()
 
     return StreamingResponse(events(), media_type='application/x-ndjson', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
