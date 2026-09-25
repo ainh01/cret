@@ -235,23 +235,36 @@ async function executeSteps(plan,input,model,signal,onStep,onText,request=genera
           const sourceId=step.sources[0]?.id;
           const siblings=(sourceId!==undefined)?parallelGroups.get(sourceId)||[]:[]; const isFirst=siblings[0]===index;
           
-          if(isFirst&&siblings.length>1){
+          // Start step 2's /chat before preparing its later siblings.
+          const directPromise=isFirst&&siblings.length>1
+            ? request(prompt,model,signal,text=>preview(index,text)) : null;
+          if(directPromise){
             for(let i=1;i<siblings.length;i++){
               const siblingIndex=siblings[i];
-              prepares.set(siblingIndex,(async()=>{
-                const siblingStep=plan[siblingIndex];
-                const siblingPrompt=siblingStep.prefix+selected+siblingStep.suffix;
-                return await prepareChat(siblingPrompt,model,signal);
-              })());
+              const siblingStep=plan[siblingIndex];
+              // Each sibling can select a different format from the same source.
+              const preparation=(async()=>{
+                const sourceResult=await jobs.get(sourceId);
+                const mode=siblingStep.sources[0].mode;
+                const content=mode==='quiz'?await quiz(siblingStep.sources[0],sourceResult):selectContent(sourceResult.text,mode);
+                const siblingPrompt=siblingStep.prefix+content+siblingStep.suffix;
+                return prepareChat(siblingPrompt,model,signal);
+              })();
+              // Retain failures until the sibling is consumed.
+              prepares.set(siblingIndex,preparation.then(cacheId=>({cacheId}),error=>({error})));
             }
           }
-          
+
           const preparePromise=prepares.get(index);
           if(preparePromise){
-            const cacheId=await preparePromise;
-            text=await request(prompt,model,signal,text=>preview(index,text),{cache_id:cacheId});
+            // Only consume a prepared response after the preceding sibling has finished.
+            const previousIndex=siblings[siblings.indexOf(index)-1];
+            await jobs.get(plan[previousIndex].id);
+            const prepared=await preparePromise;
+            if(prepared.error)throw prepared.error;
+            text=await request(prompt,model,signal,text=>preview(index,text),{cache_id:prepared.cacheId});
           }else{
-            text=await request(prompt,model,signal,text=>preview(index,text));
+            text=await (directPromise||request(prompt,model,signal,text=>preview(index,text)));
           }
         }else{
           text=selected;
