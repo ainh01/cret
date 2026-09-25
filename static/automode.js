@@ -146,6 +146,13 @@ function showOutput(text){
   if(!document.hidden&&document.hasFocus()&&el('auto-follow').checked)el('auto-output').scrollTop=el('auto-output').scrollHeight;
 }
 
+async function prepareChat(prompt,model,signal,context={}){
+  const response=await fetch('/api/prepare-chat',{method:'POST',signal,headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,model,...context})});
+  if(!response.ok)throw Error(`Prepare failed: HTTP ${response.status}`);
+  const data=await response.json();
+  return data.cache_id;
+}
+
 async function generate(prompt,model,signal,onText,context={}){
   const response=await fetch('/api/chat',{method:'POST',signal,headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,model,...context})});
   if(!response.ok)throw Error(`API returned HTTP ${response.status}`);
@@ -168,7 +175,7 @@ async function generate(prompt,model,signal,onText,context={}){
 }
 
 async function executeSteps(plan,input,model,signal,onStep,onText,request=generate){
-  const jobs=new Map(),quizzes=new Map(),previews=new Map();
+  const jobs=new Map(),quizzes=new Map(),previews=new Map(),prepares=new Map();
   function preview(index,text){previews.set(index,text);onText([...previews].sort((a,b)=>a[0]-b[0]).map(([i,value])=>`Step ${i+1}\n${value}`).join('\n\n────────\n\n'));}
   for(let index=1;index<plan.length;index++){
     const step=plan[index];
@@ -190,6 +197,16 @@ async function executeSteps(plan,input,model,signal,onStep,onText,request=genera
     })());
     return quizzes.get(source.id);
   }
+  
+  const parallelGroups=new Map();
+  for(const [index,step] of plan.entries()){
+    if(step.type==='ai'&&step.sources.length===1){
+      const sourceId=step.sources[0].id;
+      if(!parallelGroups.has(sourceId))parallelGroups.set(sourceId,[]);
+      parallelGroups.get(sourceId).push(index);
+    }
+  }
+  
   for(const [index,step] of plan.entries()){
     const sources=plan.slice(0,index).filter(node=>step.sources.some(source=>source.id===node.id));
     jobs.set(step.id,(async()=>{
@@ -203,7 +220,33 @@ async function executeSteps(plan,input,model,signal,onStep,onText,request=genera
         const selected=index===0?input:results.join('\n\n');
         const prompt=step.prefix+selected+step.suffix;
         if(step.type==='ai'&&!prompt.trim())throw Error(`Step ${index+1} has an empty prompt.`);
-        const text=step.type==='ai'?await request(prompt,model,signal,text=>preview(index,text)):selected;
+        
+        let text;
+        if(step.type==='ai'){
+          const sourceId=step.sources[0].id;
+          const siblings=parallelGroups.get(sourceId)||[];
+          const isFirst=siblings[0]===index;
+          
+          if(!isFirst&&siblings.length>1){
+            const cacheId=await prepares.get(index);
+            text=await request(prompt,model,signal,text=>preview(index,text),{cache_id:cacheId});
+          }else{
+            if(siblings.length>1){
+              for(let i=1;i<siblings.length;i++){
+                const siblingIndex=siblings[i];
+                prepares.set(siblingIndex,(async()=>{
+                  const siblingStep=plan[siblingIndex];
+                  const siblingPrompt=siblingStep.prefix+selected+siblingStep.suffix;
+                  return await prepareChat(siblingPrompt,model,signal);
+                })());
+              }
+            }
+            text=await request(prompt,model,signal,text=>preview(index,text));
+          }
+        }else{
+          text=selected;
+        }
+        
         onStep(index,step.type!=='ai','Complete');
         return {text,prompt:step.type==='ai'?prompt:''};
       }catch(error){onStep(index,false,'Failed: '+error.message);throw error;}
