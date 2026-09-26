@@ -8,6 +8,7 @@ quiz = (root / 'quiz.html').read_text(encoding='utf-8')
 context = quickjs.Context()
 context.eval('const START_MARKER="```quiz",END_MARKER="endquiz```",OPTION_VALUES=["A","B","C","D"];'
              + 'function processInput(' + quiz.split('    function processInput(', 1)[1].split('</script>', 1)[0])
+context.eval('function fetch(){return Promise.resolve({json:async()=>({hide_output:false})});}')
 context.eval(source.split("el('add-step').onclick", 1)[0])
 context.eval(r'''
 var outcome='pending';
@@ -22,22 +23,28 @@ function node(id,type,sources,prefix=''){return {id,type,sources,prefix,suffix:'
    const invalid=JSON.parse(JSON.stringify(saved));change(invalid);let rejected=false;
    try{validateAutomation(invalid);}catch{rejected=true;}check(rejected,'Invalid import accepted');
  }
- const plan=[node(1,'ai',[]),node(2,'ai',[{id:1,mode:'txt'}],'Left:'),node(3,'ai',[{id:1,mode:'all'}],'Right:'),node(4,'combine',[{id:3,mode:'all'},{id:2,mode:'all'}]),node(5,'final',[{id:4,mode:'all'}])];
- let calls=[],release,started=0;
- const request=async prompt=>{
-   calls.push(prompt);
-   if(calls.length===1)return '```txt\nROOT\n```';
-   started++;
-   if(started===1)await new Promise(resolve=>{release=resolve;});
-   else release();
-   return prompt.startsWith('Left:')?'LEFT':'RIGHT';
+ const plan=[node(1,'ai',[]),node(2,'ai',[{id:1,mode:'txt'}],'Left:'),node(3,'ai',[{id:1,mode:'all'}],'Right:'),node(4,'ai',[{id:1,mode:'all'}],'Third:'),node(5,'combine',[{id:4,mode:'all'},{id:3,mode:'all'},{id:2,mode:'all'}]),node(6,'final',[{id:5,mode:'all'}])];
+ let calls=[],release2,release3;
+ prepareChat=async prompt=>{calls.push('prepare '+prompt);return 'id-'+prompt;};
+ const request=async (prompt,model,signal,onText,context)=>{
+   if(context?.cache_id){calls.push('cache '+prompt);if(prompt.startsWith('Right:'))await new Promise(resolve=>{release3=resolve;});return prompt.startsWith('Right:')?'RIGHT':'THIRD';}
+   calls.push('direct '+prompt);
+   if(prompt==='INPUT')return '```txt\nROOT\n```';
+   await new Promise(resolve=>{release2=resolve;});return 'LEFT';
  };
- const result=await executeSteps(plan,'INPUT','model',signal,noop,noop,request);
- check(started===2,'Branches did not start concurrently');
- check(calls[1]==='Left:ROOT','TXT selection failed');
- check(calls[2]==='Right:```txt\nROOT\n```','All selection failed');
- check(result==='LEFT\n\nRIGHT','Combine must use step order');
- check(calls.length===3,'Combine/final must not call AI');
+ const pending=executeSteps(plan,'INPUT','model',signal,noop,noop,request);
+ for(let i=0;i<12;i++)await Promise.resolve();
+ check(calls.includes('direct Left:ROOT')&&calls.includes('prepare Right:```txt\nROOT\n```')&&calls.includes('prepare Third:```txt\nROOT\n```'),'Step 2 direct and later siblings prepared concurrently '+JSON.stringify(calls));
+ check(calls.indexOf('direct Left:ROOT')<calls.indexOf('prepare Right:```txt\nROOT\n```'),'Step 2 /chat must start before step 3 /prepare-chat');
+ check(!calls.some(call=>call.startsWith('cache ')),'Prepared siblings must wait until step 2 finishes');
+ release2();for(let i=0;i<12;i++)await Promise.resolve();
+ check(calls.includes('cache Right:```txt\nROOT\n```'),'Step 3 cache must be consumed after step 2');
+ check(!calls.includes('cache Third:```txt\nROOT\n```'),'Step 4 cache must wait for step 3');
+ release3();
+ const result=await pending;
+ check(calls.includes('cache Third:```txt\nROOT\n```'),'Step 4 cache must be consumed after step 3');
+ check(result==='LEFT\n\nRIGHT\n\nTHIRD','Combine must use step order');
+ check(calls.length===6,'Combine/final must not call AI');
  const multiSaved={...saved,inputs:['one','two','three']};
  check(validateAutomation(multiSaved).inputs.join('|')==='one|two|three','Multiple inputs saved');
  check(validateAutomation(saved).inputs[0]==='saved input','Legacy input import');

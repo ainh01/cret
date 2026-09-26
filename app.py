@@ -276,16 +276,22 @@ async def prepare_chat(body: PrepareRequest):
 
 
 async def stream_to_cache(cache_id: str, model: str, messages: list):
+    import sys
+    print(f"[stream_to_cache] Starting for cache_id={cache_id}", file=sys.stderr)
     cache_entry = app.state.chat_cache.get(cache_id)
     if not cache_entry:
+        print(f"[stream_to_cache] Cache entry not found for {cache_id}", file=sys.stderr)
         return
     
     endpoint, token = settings.endpoint, settings.token
+    print(f"[stream_to_cache] endpoint={endpoint}, model={model}", file=sys.stderr)
     
     try:
+        print(f"[stream_to_cache] About to make API call", file=sys.stderr)
         async with api_client().stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
             'model': model, 'messages': messages, 'stream': True,
         }) as response:
+            print(f"[stream_to_cache] Got response status={response.status_code}", file=sys.stderr)
             if response.is_error:
                 await response.aread()
                 cache_entry['error'] = f'API returned HTTP {response.status_code}'
@@ -293,37 +299,48 @@ async def stream_to_cache(cache_id: str, model: str, messages: list):
                 return
             
             if 'application/json' in response.headers.get('content-type', ''):
+                print(f"[stream_to_cache] Non-streaming response", file=sys.stderr)
                 data = json.loads(await response.aread())
                 text = data['choices'][0]['message'].get('content') or ''
                 cache_entry['chunks'].append(text)
                 cache_entry['completed'] = True
+                print(f"[stream_to_cache] Completed with {len(text)} chars", file=sys.stderr)
                 return
             
+            print(f"[stream_to_cache] Starting to read stream", file=sys.stderr)
+            chunk_count = 0
             async for line in response.aiter_lines():
                 if not line.startswith('data:'):
                     continue
                 payload = line[5:].strip()
                 if payload == '[DONE]':
                     cache_entry['completed'] = True
+                    print(f"[stream_to_cache] Got [DONE], chunks={chunk_count}", file=sys.stderr)
                     break
                 data = json.loads(payload)
                 if data.get('error'):
                     cache_entry['error'] = 'Provider error'
                     cache_entry['completed'] = True
+                    print(f"[stream_to_cache] Provider error", file=sys.stderr)
                     return
                 for choice in data.get('choices', []):
                     text = choice.get('delta', {}).get('content')
                     if text:
                         cache_entry['chunks'].append(text)
+                        chunk_count += 1
                     if choice.get('finish_reason'):
                         cache_entry['completed'] = True
+                        print(f"[stream_to_cache] Got finish_reason, chunks={chunk_count}", file=sys.stderr)
             
             # Ensure completed is set even if stream ends without [DONE]
             cache_entry['completed'] = True
-    except httpx.HTTPError:
+            print(f"[stream_to_cache] Stream ended, total chunks={chunk_count}", file=sys.stderr)
+    except httpx.HTTPError as e:
+        print(f"[stream_to_cache] HTTPError: {e}", file=sys.stderr)
         cache_entry['error'] = 'Connection failed'
         cache_entry['completed'] = True
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"[stream_to_cache] Parse error: {e}", file=sys.stderr)
         cache_entry['error'] = 'Unexpected response format'
         cache_entry['completed'] = True
     except Exception as e:
@@ -365,6 +382,8 @@ async def chat(body: ChatRequest):
             return json.dumps(data) + '\n'
         
         if cache_entry is not None:
+            import sys
+            print(f"[chat] Using cache_id={body.cache_id}, completed={cache_entry['completed']}, chunks={len(cache_entry['chunks'])}", file=sys.stderr)
             sent_chunks = 0
             try:
                 while True:
@@ -375,6 +394,7 @@ async def chat(body: ChatRequest):
                         sent_chunks += 1
                     
                     if cache_entry['completed']:
+                        print(f"[chat] Cache completed, error={cache_entry['error']}, total_chunks={sent_chunks}", file=sys.stderr)
                         if cache_entry['error']:
                             yield event({'error': cache_entry['error']})
                         else:
