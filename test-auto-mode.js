@@ -27,19 +27,19 @@ async function streamSSE(url, body) {
         buffer = lines.pop();
 
         for (const line of lines) {
-            if (line.startsWith('data: ')) {
-                const data = line.slice(6).trim();
-                if (data === '[DONE]' || data === '') continue;
-                
-                try {
-                    const parsed = JSON.parse(data);
-                    if (parsed.text) {
-                        process.stdout.write(parsed.text);
-                        fullText += parsed.text;
-                    }
-                } catch (e) {
-                    // Ignore parse errors
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            const data = trimmed.startsWith('data: ') ? trimmed.slice(6).trim() : trimmed;
+            if (data === '[DONE]' || data === '') continue;
+            
+            try {
+                const parsed = JSON.parse(data);
+                if (parsed.text) {
+                    process.stdout.write(parsed.text);
+                    fullText += parsed.text;
                 }
+            } catch (e) {
+                // Ignore parse errors
             }
         }
     }

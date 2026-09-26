@@ -60,6 +60,8 @@ async def lifespan(app):
         limits=limits,
     )
     app.state.chat_cache = {}
+    app.state.chat_queue = asyncio.Queue()
+    workers = [asyncio.create_task(chat_worker()) for _ in range(3)]
 
     async def cache_janitor():
         while True:
@@ -71,6 +73,8 @@ async def lifespan(app):
         yield
     finally:
         janitor.cancel()
+        for worker in workers:
+            worker.cancel()
         for cache_id in list(app.state.chat_cache):
             drop_cache_entry(cache_id)
         await app.state.client.aclose()
@@ -220,12 +224,7 @@ async def quiz_parser():
 
 
 def drop_cache_entry(cache_id):
-    entry = app.state.chat_cache.pop(cache_id, None)
-    if entry:
-        task = entry.get('task')
-        if task and not task.done():
-            task.cancel()
-    return entry
+    app.state.chat_cache.pop(cache_id, None)
 
 
 def purge_expired_cache():
@@ -266,13 +265,24 @@ async def prepare_chat(body: PrepareRequest):
         'completed': False,
         'error': None,
         'expires_at': datetime.now() + timedelta(hours=1),
-        'task': None
+        'messages': messages,
+        'model': body.model,
     }
     app.state.chat_cache[cache_id] = cache_entry
     
-    cache_entry['task'] = asyncio.create_task(stream_to_cache(cache_id, body.model, messages))
+    app.state.chat_queue.put_nowait(cache_id)
     
     return {'cache_id': cache_id}
+
+
+async def chat_worker():
+    # Middleware worker: pulls prepared jobs off the queue and talks to the AI company.
+    while True:
+        cache_id = await app.state.chat_queue.get()
+        cache_entry = app.state.chat_cache.get(cache_id)
+        if cache_entry is not None and not cache_entry['completed']:
+            await stream_to_cache(cache_id, cache_entry['model'], cache_entry['messages'])
+        app.state.chat_queue.task_done()
 
 
 async def stream_to_cache(cache_id: str, model: str, messages: list):
@@ -382,31 +392,36 @@ async def chat(body: ChatRequest):
             return json.dumps(data) + '\n'
         
         if cache_entry is not None:
-            import sys
+            import sys, time
             print(f"[chat] Using cache_id={body.cache_id}, completed={cache_entry['completed']}, chunks={len(cache_entry['chunks'])}", file=sys.stderr)
+            # First byte immediately so the client never stares at a dead connection.
+            yield event({'ping': True})
             sent_chunks = 0
-            try:
-                while True:
-                    while sent_chunks < len(cache_entry['chunks']):
-                        chunk = cache_entry['chunks'][sent_chunks]
-                        if to_client:
-                            yield event({'text': chunk})
-                        sent_chunks += 1
-                    
-                    if cache_entry['completed']:
-                        print(f"[chat] Cache completed, error={cache_entry['error']}, total_chunks={sent_chunks}", file=sys.stderr)
-                        if cache_entry['error']:
-                            yield event({'error': cache_entry['error']})
-                        else:
-                            if not to_client and cache_entry['chunks']:
-                                full_text = ''.join(cache_entry['chunks'])
-                                yield event({'text': full_text})
-                            yield event({'done': True})
-                        return
-                    
-                    await asyncio.sleep(0.1)
-            finally:
-                drop_cache_entry(body.cache_id)
+            last_ping = time.monotonic()
+            while True:
+                while sent_chunks < len(cache_entry['chunks']):
+                    chunk = cache_entry['chunks'][sent_chunks]
+                    if to_client:
+                        yield event({'text': chunk})
+                    sent_chunks += 1
+                    last_ping = time.monotonic()
+                
+                if cache_entry['completed']:
+                    print(f"[chat] Cache completed, error={cache_entry['error']}, total_chunks={sent_chunks}", file=sys.stderr)
+                    if cache_entry['error']:
+                        yield event({'error': cache_entry['error']})
+                    else:
+                        if not to_client and cache_entry['chunks']:
+                            full_text = ''.join(cache_entry['chunks'])
+                            yield event({'text': full_text})
+                        yield event({'done': True})
+                    return
+                
+                if time.monotonic() - last_ping > 10:
+                    # Still thinking upstream; keep the connection visibly alive.
+                    yield event({'ping': True})
+                    last_ping = time.monotonic()
+                await asyncio.sleep(0.1)
         
         full = ''
         try:
